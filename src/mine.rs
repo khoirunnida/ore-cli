@@ -1,5 +1,5 @@
-use std::{sync::Arc, time::Instant};
-
+use std::{sync::Arc, sync::RwLock, time::Instant};
+ 
 use colored::*;
 use drillx::{
     equix::{self},
@@ -13,23 +13,23 @@ use rand::Rng;
 use solana_program::pubkey::Pubkey;
 use solana_rpc_client::spinner;
 use solana_sdk::signer::Signer;
-
+ 
 use crate::{
     args::MineArgs,
     send_and_confirm::ComputeBudget,
     utils::{amount_u64_to_string, get_clock, get_config, get_proof_with_authority, proof_pubkey},
     Miner,
 };
-
+ 
 impl Miner {
     pub async fn mine(&self, args: MineArgs) {
         // Register, if needed.
         let signer = self.signer();
         self.open().await;
-
+ 
         // Check num threads
         self.check_num_cores(args.threads);
-
+ 
         // Start mining loop
         loop {
             // Fetch proof
@@ -40,19 +40,19 @@ impl Miner {
                 amount_u64_to_string(proof.balance),
                 calculate_multiplier(proof.balance, config.top_balance)
             );
-
+ 
             // Calc cutoff time
             let cutoff_time = self.get_cutoff(proof, args.buffer_time).await;
-
+ 
             // Run drillx
             let solution = Self::find_hash_par(
                 proof,
                 cutoff_time,
                 args.threads,
-                config.min_difficulty as u32,
+                17,
             )
             .await;
-
+ 
             // Submit most difficult hash
             let mut compute_budget = 500_000;
             let mut ixs = vec![ore_api::instruction::auth(proof_pubkey(signer.pubkey()))];
@@ -71,7 +71,7 @@ impl Miner {
                 .ok();
         }
     }
-
+ 
     async fn find_hash_par(
         proof: Proof,
         cutoff_time: u64,
@@ -81,8 +81,10 @@ impl Miner {
         // Dispatch job to each thread
         let progress_bar = Arc::new(spinner::new_progress_bar());
         progress_bar.set_message("Mining...");
+        let global_best_difficulty = Arc::new(RwLock::new(0u32));
         let handles: Vec<_> = (0..threads)
             .map(|i| {
+                let global_best_difficulty = Arc::clone(&global_best_difficulty);
                 std::thread::spawn({
                     let proof = proof.clone();
                     let progress_bar = progress_bar.clone();
@@ -105,35 +107,48 @@ impl Miner {
                                     best_nonce = nonce;
                                     best_difficulty = difficulty;
                                     best_hash = hx;
+                                    if best_difficulty.gt(&*global_best_difficulty.read().unwrap()) {
+                                        *global_best_difficulty.write().unwrap() = best_difficulty;
+                                    }
                                 }
                             }
-
+ 
                             // Exit if time has elapsed
                             if nonce % 100 == 0 {
+                                let global_best_difficulty = *global_best_difficulty.read().unwrap();
                                 if timer.elapsed().as_secs().ge(&cutoff_time) {
-                                    if best_difficulty.ge(&min_difficulty) {
+                                    if i == 0 {
+                                        progress_bar.set_message(format!(
+                                            "Mining... ({} / {} difficulty)",
+                                            global_best_difficulty,
+                                            min_difficulty,
+                                        ));
+                                    }
+                                    if global_best_difficulty.ge(&min_difficulty) {
                                         // Mine until min difficulty has been met
                                         break;
                                     }
                                 } else if i == 0 {
                                     progress_bar.set_message(format!(
-                                        "Mining... ({} sec remaining)",
+                                        "Mining... ({} / {} difficulty, {} sec remaining)",
+                                        global_best_difficulty,
+                                        min_difficulty,
                                         cutoff_time.saturating_sub(timer.elapsed().as_secs()),
                                     ));
                                 }
                             }
-
+ 
                             // Increment nonce
                             nonce += 1;
                         }
-
+ 
                         // Return the best nonce
                         (best_nonce, best_difficulty, best_hash)
                     }
                 })
             })
             .collect();
-
+ 
         // Join handles and return best nonce
         let mut best_nonce = 0;
         let mut best_difficulty = 0;
@@ -147,17 +162,17 @@ impl Miner {
                 }
             }
         }
-
+ 
         // Update log
         progress_bar.finish_with_message(format!(
             "Best hash: {} (difficulty: {})",
             bs58::encode(best_hash.h).into_string(),
             best_difficulty
         ));
-
+ 
         Solution::new(best_hash.d, best_nonce.to_le_bytes())
     }
-
+ 
     pub fn check_num_cores(&self, threads: u64) {
         // Check num threads
         let num_cores = num_cpus::get() as u64;
@@ -170,7 +185,7 @@ impl Miner {
             );
         }
     }
-
+ 
     async fn should_reset(&self, config: Config) -> bool {
         let clock = get_clock(&self.rpc_client).await;
         config
@@ -179,7 +194,7 @@ impl Miner {
             .saturating_sub(5) // Buffer
             .le(&clock.unix_timestamp)
     }
-
+ 
     async fn get_cutoff(&self, proof: Proof, buffer_time: u64) -> u64 {
         let clock = get_clock(&self.rpc_client).await;
         proof
@@ -190,11 +205,11 @@ impl Miner {
             .max(0) as u64
     }
 }
-
+ 
 fn calculate_multiplier(balance: u64, top_balance: u64) -> f64 {
     1.0 + (balance as f64 / top_balance as f64).min(1.0f64)
 }
-
+ 
 // TODO Pick a better strategy (avoid draining bus)
 fn find_bus() -> Pubkey {
     let i = rand::thread_rng().gen_range(0..BUS_COUNT);
